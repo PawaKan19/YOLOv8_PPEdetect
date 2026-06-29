@@ -34,7 +34,7 @@ def select_roi_interactive(image_path):
 
 class PPEDetector:
     
-    def __init__(self, conf_ppe=0.05, conf_person=0.005, use_sahi=True, use_sahi_ppe=True, roi=None):
+    def __init__(self, conf_ppe=0.0075, conf_person=0.005, use_sahi=True, use_sahi_ppe=True, roi=None):
         self.model_ppe    = YOLO(MODEL_PPE)
         self.model_person = YOLO(MODEL_PERSON)
         self.conf_ppe     = conf_ppe
@@ -416,10 +416,10 @@ def main():
     #roi = select_roi_interactive(image_path) # if you don't know the ROI, use this function to select it
     roi = (220, 47, 524, 222) # (x1, y1, x2, y2)
 
-    detector = PPEDetector(conf_ppe=0.05, conf_person=0.005, use_sahi=True, use_sahi_ppe=True, roi=roi)
+    detector = PPEDetector(conf_ppe=0.0075, conf_person=0.005, use_sahi=True, use_sahi_ppe=True, roi=roi)
 
     roi_status = f"ROI: {roi}" if roi else "ROI: Full Image"
-    print(f"conf_ppe: 0.05 | conf_person: 0.005 | SAHI-PPE: 64x64 Ultra-Aggressive")
+    print(f"conf_ppe: 0.0075 | conf_person: 0.005 | SAHI-PPE: 64x64 Ultra-Aggressive")
     print(f"Person SAHI: ON (128x128, 75% overlap)")
     print(f"PPE: ROI-Cropped Detection")
     print(roi_status)
