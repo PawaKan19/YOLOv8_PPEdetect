@@ -1,26 +1,39 @@
+import os
+from datetime import datetime, timezone
+
 import cv2
 import numpy as np
+import requests
 from ultralytics import YOLO
 from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
 
 MODEL_PERSON = 'yolov8n.pt'
 
+# ===== Camera Events API config =====
+# แนะนำให้ตั้งค่าผ่าน environment variable แทนการ hardcode
+API_URL = os.getenv(
+    "CAMERA_EVENT_API_URL",
+    "https://cpaciot.cipcloud.net/iot-service/api/v1/camera-events"
+)
+API_KEY = os.getenv("CAMERA_EVENT_API_KEY", "camera-event-secret-token-2026")
+
+
 def select_roi_interactive(image_path):
     img = cv2.imread(str(image_path))
     if img is None:
         print(f"Error: Cannot read image from {image_path}")
         return None
-    
+
     print("\n=== ROI Selection ===")
     print("1. Click and drag to select ROI")
     print("2. Press SPACE or ENTER to confirm")
     print("3. Press 'c' to clear and reselect")
     print("4. Press ESC to cancel\n")
-    
+
     roi = cv2.selectROI("Select ROI (SPACE=confirm, c=clear, ESC=cancel)", img, False, False)
     cv2.destroyAllWindows()
-    
+
     if roi[2] > 0 and roi[3] > 0:
         x, y, w, h = roi
         roi_coords = (x, y, x + w, y + h)
@@ -30,16 +43,32 @@ def select_roi_interactive(image_path):
         print("No ROI selected")
         return None
 
+
 class KYTDetector:
-    
-    def __init__(self, conf_person=0.005, use_sahi=True, roi=None, kyt_threshold=3):
+
+    def __init__(self, conf_person=0.005, use_sahi=True, roi=None, kyt_threshold=3,
+                 # ---- Camera Events API params ----
+                 camera_id="CAM-001", serial_number="SN-000000",
+                 camera_model="KYT-Detector", send_events=True,
+                 api_url=API_URL, api_key=API_KEY):
         self.model_person = YOLO(MODEL_PERSON)
         self.conf_person  = conf_person
         self.unique_ids   = set()
         self.use_sahi     = use_sahi
         self.roi          = roi
         self.kyt_threshold = kyt_threshold
-        
+
+        # ---- API config ----
+        self.camera_id     = camera_id
+        self.serial_number = serial_number
+        self.camera_model  = camera_model      # ส่งเป็น field "model" ใน API
+        self.send_events   = send_events
+        self.api_url       = api_url
+        self.api_key       = api_key
+
+        # ---- state สำหรับติดตามการเปลี่ยนสถานะในวิดีโอ ----
+        self._kyt_active   = False   # สถานะ KYT ของเฟรมก่อนหน้า
+
         if use_sahi:
             self.sahi_model = AutoDetectionModel.from_pretrained(
                 model_type='yolov8',
@@ -47,7 +76,69 @@ class KYTDetector:
                 confidence_threshold=conf_person,
                 device='cuda:0'
             )
-        
+
+    # ============================================================
+    # Camera Events API
+    # ============================================================
+    def send_camera_event(self, frame, event="have_kyt", event_at=None):
+        """
+        แปลงเฟรมเป็น JPEG แล้ว POST ไปที่ Camera Events API แบบ multipart/form-data
+
+        event: หนึ่งใน truck_loading | have_truck_waiting | have_kyt | operator_not_stand_by
+        """
+        if not self.send_events:
+            return None
+
+        # encode เป็น JPEG ในหน่วยความจำ (ไม่ต้องเซฟลงดิสก์)
+        ok, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        if not ok:
+            print("[API] Error: cannot encode frame to JPEG")
+            return None
+        image_bytes = buffer.tobytes()
+
+        # กันไฟล์ใหญ่เกิน 10MB ตามสเปก API
+        if len(image_bytes) > 10 * 1024 * 1024:
+            print("[API] Warning: image > 10MB, skip sending")
+            return None
+
+        if event_at is None:
+            # ISO 8601 พร้อม timezone เช่น 2026-06-25T22:00:00+00:00
+            event_at = datetime.now(timezone.utc).isoformat()
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        data = {
+            "camera_id": self.camera_id,
+            "serial_number": self.serial_number,
+            "model": self.camera_model,
+            "event": event,
+            "event_at": event_at,
+        }
+        files = {
+            "image": ("snapshot.jpg", image_bytes, "image/jpeg")
+        }
+
+        try:
+            resp = requests.post(self.api_url, headers=headers, data=data,
+                                 files=files, timeout=10)
+            if resp.status_code == 201:
+                print(f"[API] OK 201 | event={event} | {resp.json().get('message')}")
+            else:
+                print(f"[API] Failed {resp.status_code} | {resp.text[:200]}")
+            return resp
+        except requests.RequestException as e:
+            print(f"[API] Request error: {e}")
+            return None
+
+    def _maybe_send_kyt(self, frame, person_count):
+        """
+        ยิง event have_kyt เฉพาะตอนที่สถานะเปลี่ยนจาก Normal → Have KYT
+        (ขอบขาขึ้น) เท่านั้น ไม่ยิงซ้ำตราบใดที่ยังเข้าเงื่อนไขค้างอยู่
+        """
+        is_kyt = person_count >= self.kyt_threshold
+        if is_kyt and not self._kyt_active:
+            self.send_camera_event(frame, event="have_kyt")
+        self._kyt_active = is_kyt
+
     def count_people_in_roi(self, persons):
         count = 0
         for person in persons:
@@ -58,7 +149,7 @@ class KYTDetector:
     def get_person_detections(self, frame, track=False):
         if self.use_sahi and not track:
             return self._get_person_sahi(frame)
-        
+
         if track:
             results = self.model_person.track(
                 frame, conf=self.conf_person, iou=0.4,
@@ -78,7 +169,7 @@ class KYTDetector:
                 track_id = int(box.id[0]) if (track and box.id is not None) else None
                 persons.append({'box': (x1, y1, x2, y2), 'conf': conf, 'id': track_id})
         return persons
-    
+
     def _get_person_sahi(self, frame):
         h, w = frame.shape[:2]
         if self.roi:
@@ -124,7 +215,7 @@ class KYTDetector:
                     x1, y1, x2, y2 = int(bbox.minx), int(bbox.miny), int(bbox.maxx), int(bbox.maxy)
                     persons.append({'box': (x1, y1, x2, y2), 'conf': obj.score.value, 'id': None})
         return persons
-    
+
     def _is_in_roi(self, box):
         if self.roi is None:
             return True
@@ -132,7 +223,7 @@ class KYTDetector:
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         roi_x1, roi_y1, roi_x2, roi_y2 = self.roi
         return roi_x1 <= cx <= roi_x2 and roi_y1 <= cy <= roi_y2
-    
+
     def draw_roi(self, frame):
         if self.roi is not None:
             x1, y1, x2, y2 = self.roi
@@ -149,20 +240,20 @@ class KYTDetector:
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.7
             thickness = 2
-            
+
             text_size, _ = cv2.getTextSize(alert_text, font, font_scale, thickness)
             text_w, text_h = text_size
-            
+
             padding = 10
             box_x = w - text_w - padding * 2 - 10
             box_y = 10
             box_w = text_w + padding * 2
             box_h = text_h + padding * 2
-            
+
             overlay = frame.copy()
             cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 255), -1)
             cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-            
+
             text_x = box_x + padding
             text_y = box_y + text_h + padding
             cv2.putText(frame, alert_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
@@ -173,7 +264,6 @@ class KYTDetector:
         self.draw_kyt_alert(annotated, person_count)
         return annotated
 
-
     def detect_image(self, image_path, output_path=None, show=True):
         frame = cv2.imread(str(image_path))
         if frame is None:
@@ -183,16 +273,21 @@ class KYTDetector:
         persons = self.get_person_detections(frame, track=False)
         person_count = self.count_people_in_roi(persons)
         annotated = self.draw_results(frame, person_count)
+        has_kyt = person_count >= self.kyt_threshold
 
         if output_path:
             cv2.imwrite(str(output_path), annotated)
             print(f"Saved result to: {output_path}")
 
+        # ---- ส่ง event ไป API เมื่อเจอ KYT ----
+        if has_kyt:
+            self.send_camera_event(annotated, event="have_kyt")
+
         if show:
             cv2.imshow('KYT Detection - Image', annotated)
             print("\nDetection Summary:")
             print(f"  People in ROI: {person_count}")
-            if person_count >= self.kyt_threshold:
+            if has_kyt:
                 print(f"  Status: Have KYT (>={self.kyt_threshold} people)")
             else:
                 print(f"  Status: Normal (<{self.kyt_threshold} people)")
@@ -200,7 +295,7 @@ class KYTDetector:
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
-        return {'person_count': person_count, 'has_kyt': person_count >= self.kyt_threshold}
+        return {'person_count': person_count, 'has_kyt': has_kyt}
 
     def detect_video(self, video_path, output_path=None, show=True):
         cap = cv2.VideoCapture(str(video_path))
@@ -219,6 +314,7 @@ class KYTDetector:
             writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
         self.unique_ids = set()
+        self._kyt_active = False
         frame_count = 0
         kyt_frames = 0
 
@@ -234,11 +330,11 @@ class KYTDetector:
             frame_count += 1
             persons = self.get_person_detections(frame, track=True)
             person_count = self.count_people_in_roi(persons)
-            
+
             for person in persons:
                 if person['id'] is not None and self._is_in_roi(person['box']):
                     self.unique_ids.add(person['id'])
-            
+
             if person_count >= self.kyt_threshold:
                 kyt_frames += 1
 
@@ -246,6 +342,9 @@ class KYTDetector:
             cv2.putText(annotated,
                        f"Frame: {frame_count} | Unique People: {len(self.unique_ids)}",
                        (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # ---- ยิง event เฉพาะตอนเริ่มเปลี่ยนเป็น KYT ----
+            self._maybe_send_kyt(annotated, person_count)
 
             if writer:
                 writer.write(annotated)
@@ -289,9 +388,16 @@ def main():
     print("="*50)
 
     #roi = select_roi_interactive(image_path)
-    roi = (220, 47, 524, 222) # (x1, y1, x2, y2)
+    roi = (220, 47, 524, 222)  # (x1, y1, x2, y2)
 
-    detector = KYTDetector(conf_person=0.005, use_sahi=True, roi=roi, kyt_threshold=3)
+    detector = KYTDetector(
+        conf_person=0.005, use_sahi=True, roi=roi, kyt_threshold=3,
+        # ---- ข้อมูลกล้องสำหรับส่งเข้า API ----
+        camera_id="CAM-ZONE-A",
+        serial_number="CPAC-CAM-1029",
+        camera_model="Hikvision-DS-2CD2087G2",
+        send_events=True,   # ตั้ง False เพื่อปิดการส่ง API ตอนทดสอบ
+    )
 
     roi_status = f"ROI: {roi}" if roi else "ROI: Full Image"
     print(f"conf_person: 0.005 | Person SAHI: ON (128x128, 75% overlap)")
