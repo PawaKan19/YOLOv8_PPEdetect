@@ -377,8 +377,8 @@ class KYTDetector:
 
 
 def main():
-    image_path = r'D:\InternProject\YOLOv8_PPEdetect\4253CCC96C4C1915_2026-06-22T00-43-28-821Z.png'
-    output_path = r'D:\InternProject\YOLOv8_PPEdetect\output_kyt.jpg'
+    image_path = r'D:\InternProject\YOLOv8_PPEdetect\Test_30-06.png'
+    output_path = r'D:\InternProject\YOLOv8_PPEdetect\output_kyt1.jpg'
 
     # video_path  = r'D:\InternProject\4253CCC96C4C1915_2026-06-22T00-25-01-166Z.webm'
     # output_path = r'D:\InternProject\YOLOv8_PPEdetect\output_kyt_video.mp4'
@@ -388,7 +388,7 @@ def main():
     print("="*50)
 
     #roi = select_roi_interactive(image_path)
-    roi = (220, 47, 524, 222)  # (x1, y1, x2, y2)
+    roi = (219, 50, 533, 240)  # (x1, y1, x2, y2)
 
     detector = KYTDetector(
         conf_person=0.005, use_sahi=True, roi=roi, kyt_threshold=3,
